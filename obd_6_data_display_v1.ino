@@ -8,32 +8,47 @@
 const char* ssid = "Aspire-Diagnostics";
 const char* password = "12345678";
 
-// --- Network & CAN Objects ---
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 MCP2515 mcp2515(5);
 
-// --- OBD-II Constants ---
 const uint32_t OBD_REQUEST_ID = 0x7DF;
 const uint32_t ECU_RESPONSE_ID_MIN = 0x7E8;
 const uint32_t ECU_RESPONSE_ID_MAX = 0x7EF;
 
-// --- Vehicle Data Variables ---
+// --- Vehicle Data Variables (Now 10 items) ---
 int rpm = 0;
 int speed = 0;
 int coolantTemp = 0;
 int intakeTemp = 0;
 float mafFlow = 0.0;
 int engineLoad = 0;
+int throttle = 0;
+int fuelLevel = 0;
+int mapPressure = 0;
+float voltage = 0.0;
 
 // --- Polling Logic ---
 unsigned long lastPollTime = 0;
 const int POLL_INTERVAL = 100; // ms
 int currentPidIndex = 0;
-const uint8_t healthPIDs[] = {0x0C, 0x0D, 0x05, 0x0F, 0x10, 0x04}; // RPM, Speed, Coolant, Intake Temp, MAF, Load
+
+// Expanded PID List
+const uint8_t healthPIDs[] = {
+  0x0C, // RPM
+  0x0D, // Speed
+  0x05, // Coolant Temp
+  0x0F, // Intake Temp
+  0x10, // MAF
+  0x04, // Engine Load
+  0x11, // Throttle Position
+  0x2F, // Fuel Level
+  0x0B, // Intake MAP
+  0x42  // Module Voltage
+};
 const int NUM_PIDS = sizeof(healthPIDs) / sizeof(healthPIDs[0]);
 
-// --- HTML Dashboard (Stored in Program Memory) ---
+// --- HTML Dashboard ---
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -43,7 +58,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <style>
     body { font-family: Arial, sans-serif; background-color: #121212; color: #fff; text-align: center; padding: 20px; margin: 0; }
     h2 { color: #00d2ff; letter-spacing: 2px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 15px; max-width: 800px; margin: 0 auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 15px; max-width: 900px; margin: 0 auto; }
     .card { background: #1e1e1e; padding: 20px; border-radius: 12px; border-left: 4px solid #00d2ff; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
     .value { font-size: 2.5em; font-weight: bold; margin: 10px 0; color: #fff; }
     .label { font-size: 0.9em; color: #aaa; text-transform: uppercase; }
@@ -61,6 +76,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="card"><div class="label">Intake Temp</div><div class="value" id="intake">0<span class="unit"> &deg;C</span></div></div>
     <div class="card"><div class="label">Mass Air Flow</div><div class="value" id="maf">0.0<span class="unit"> g/s</span></div></div>
     <div class="card"><div class="label">Engine Load</div><div class="value" id="load">0<span class="unit"> %</span></div></div>
+    <div class="card"><div class="label">Throttle Pos</div><div class="value" id="throttle">0<span class="unit"> %</span></div></div>
+    <div class="card"><div class="label">Fuel Level</div><div class="value" id="fuel">0<span class="unit"> %</span></div></div>
+    <div class="card"><div class="label">Intake MAP</div><div class="value" id="map">0<span class="unit"> kPa</span></div></div>
+    <div class="card"><div class="label">ECU Voltage</div><div class="value" id="volt">0.0<span class="unit"> V</span></div></div>
   </div>
 
   <script>
@@ -79,6 +98,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById("intake").innerHTML = data.intake + '<span class="unit"> &deg;C</span>';
         document.getElementById("maf").innerHTML = data.maf.toFixed(1) + '<span class="unit"> g/s</span>';
         document.getElementById("load").innerHTML = data.load + '<span class="unit"> %</span>';
+        document.getElementById("throttle").innerHTML = data.thr + '<span class="unit"> %</span>';
+        document.getElementById("fuel").innerHTML = data.fuel + '<span class="unit"> %</span>';
+        document.getElementById("map").innerHTML = data.map + '<span class="unit"> kPa</span>';
+        document.getElementById("volt").innerHTML = data.volt.toFixed(1) + '<span class="unit"> V</span>';
       };
     }
     window.addEventListener('load', initWebSocket);
@@ -93,7 +116,11 @@ void notifyClients() {
                 ",\"coolant\":" + String(coolantTemp) +
                 ",\"intake\":" + String(intakeTemp) +
                 ",\"maf\":" + String(mafFlow) +
-                ",\"load\":" + String(engineLoad) + "}";
+                ",\"load\":" + String(engineLoad) +
+                ",\"thr\":" + String(throttle) +
+                ",\"fuel\":" + String(fuelLevel) +
+                ",\"map\":" + String(mapPressure) +
+                ",\"volt\":" + String(voltage) + "}";
   ws.textAll(json);
 }
 
@@ -101,28 +128,23 @@ void setup() {
   Serial.begin(115200);
   SPI.begin();
   
-  // Configure Wi-Fi AP
+  WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid, password);
-  Serial.print("Wi-Fi Started. IP: ");
-  Serial.println(WiFi.softAPIP());
 
-  // Setup Web Server and WebSocket
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html);
   });
   server.addHandler(&ws);
   server.begin();
 
-  // Initialize CAN
   mcp2515.reset();
-  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ); // Ensure 8MHz matches your physical board
+  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
   mcp2515.setNormalMode();
 }
 
 void loop() {
   ws.cleanupClients();
 
-  // 1. Poll the Car
   if (millis() - lastPollTime > POLL_INTERVAL) {
     lastPollTime = millis();
     
@@ -138,7 +160,6 @@ void loop() {
     currentPidIndex = (currentPidIndex + 1) % NUM_PIDS;
   }
 
-  // 2. Read and Parse Responses
   struct can_frame rx_frame;
   if (mcp2515.readMessage(&rx_frame) == MCP2515::ERROR_OK) {
     if (rx_frame.can_id >= ECU_RESPONSE_ID_MIN && rx_frame.can_id <= ECU_RESPONSE_ID_MAX) {
@@ -156,9 +177,12 @@ void loop() {
           case 0x0F: intakeTemp = A - 40; dataUpdated = true; break;
           case 0x10: mafFlow = ((A * 256.0) + B) / 100.0; dataUpdated = true; break;
           case 0x04: engineLoad = (A * 100) / 255; dataUpdated = true; break;
+          case 0x11: throttle = (A * 100) / 255; dataUpdated = true; break;
+          case 0x2F: fuelLevel = (A * 100) / 255; dataUpdated = true; break;
+          case 0x0B: mapPressure = A; dataUpdated = true; break;
+          case 0x42: voltage = ((A * 256.0) + B) / 1000.0; dataUpdated = true; break;
         }
 
-        // Push new data to the web dashboard instantly
         if (dataUpdated) {
           notifyClients();
         }
